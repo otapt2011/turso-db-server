@@ -241,6 +241,13 @@ module.exports = async (req, res) => {
       const dbs = discoverDatabases().map(d => d.name);
       return sendJson(res, 200, dbs);
     }
+    // Add inside the route handling, before other routes:
+if (method === 'GET' && pathname === '/api/debug') {
+  const dbs = discoverDatabases();
+  // Hide token for safety, show URL only
+  const safe = dbs.map(d => ({ name: d.name, url: d.url ? d.url.substring(0, 20) + '...' : 'MISSING' }));
+  return sendJson(res, 200, safe);
+}
 
     // Create/Delete (informational)
     const dbMatch = pathname.match(/^\/api\/database\/([^\/]+)$/);
