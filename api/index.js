@@ -202,14 +202,26 @@ module.exports = async (req, res) => {
 
   // ── PUBLIC DEBUG ROUTE (no auth) ───────────────────
   // Remove this after verifying your databases.
-  if (method === 'GET' && pathname === '/api/debug') {
-    const dbs = discoverDatabases();
-    const safe = dbs.map(d => ({
-      name: d.name,
-      url: d.url ? d.url.substring(0, 25) + '...' : 'MISSING'
-    }));
-    return sendJson(res, 200, safe);
-  }
+  // ── PUBLIC DEBUG ROUTE (no auth) ───────────────────
+if (method === 'GET' && pathname === '/api/debug') {
+  const allKeys = Object.keys(process.env)
+    .filter(k => k.startsWith('TURSO_DB_'))
+    .reduce((acc, key) => {
+      acc[key] = (process.env[key] || '').trim().substring(0, 50) + (process.env[key]?.length > 50 ? '...' : '');
+      return acc;
+    }, {});
+
+  const dbs = discoverDatabases();
+  const safe = dbs.map(d => ({
+    name: d.name,
+    url: d.url ? d.url.substring(0, 30) + '...' : 'MISSING'
+  }));
+
+  return sendJson(res, 200, {
+    rawEnvKeys: allKeys,
+    discoveredDbs: safe
+  });
+}
 
   // ── Authentication check ───────────────────────────
   const providedKey = req.headers['x-api-key'] || searchParams.get('api_key');
