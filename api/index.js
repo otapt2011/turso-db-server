@@ -41,6 +41,7 @@ function getHttpUrl(libsqlUrl) {
 }
 
 async function tursoExecute(dbUrl, dbToken, sql) {
+  if (!dbUrl) throw new Error('Database URL is empty – check environment variable');
   const endpoint = getHttpUrl(dbUrl) + '/v2/pipeline';
   const body = JSON.stringify({
     requests: [
