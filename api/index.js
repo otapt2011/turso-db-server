@@ -28,8 +28,12 @@ function discoverDatabases() {
     if (match) {
       const upper = match[1];
       const name = upper.toLowerCase();
-      const url = process.env[key];
-      const token = process.env[`TURSO_DB_${upper}_TOKEN`] || '';
+      const url = (process.env[key] || '').trim();
+      if (!url) {
+        console.warn(`Skipping ${name}: URL is empty`);
+        continue;
+      }
+      const token = (process.env[`TURSO_DB_${upper}_TOKEN`] || '').trim();
       dbs.push({ name, url, token });
     }
   }
