@@ -197,31 +197,9 @@ module.exports = async (req, res) => {
       return sendJson(res, 401, { error: 'Incorrect password' });
     }
     const token = jwt.sign({ user: 'fifa-editor' }, JWT_SECRET, { expiresIn: '24h' });
-    return sendJson(res, 200, { token });
-  }
-
-  // ── PUBLIC DEBUG ROUTE (no auth) ───────────────────
+    return sendJson(res, 200, { {"rawEnvKeys":{"TURSO_DB_FIFA2026_TOKEN":"eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciL...","TURSO_DB_FIFA2026_URL":"libsql://fifa2026-rabex.aws-us-east-1.turso.io","TURSO_DB_FIFAWC2026_TOKEN":"eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciL...","TURSO_DB_FIFAWC2026_URL":"libsql://fifawc2026-rabex.aws-us-east-1.turso.io"},"discoveredDbs":[{"name":"fifa2026","url":"libsql://fifa2026-rabex.aws-us..."},{"name":"fifawc2026","url":"libsql://fifawc2026-rabex.aws-..."}]} ── PUBLIC DEBUG ROUTE (no auth) ───────────────────
   // Remove this after verifying your databases.
   // ── PUBLIC DEBUG ROUTE (no auth) ───────────────────
-if (method === 'GET' && pathname === '/api/debug') {
-  const allKeys = Object.keys(process.env)
-    .filter(k => k.startsWith('TURSO_DB_'))
-    .reduce((acc, key) => {
-      acc[key] = (process.env[key] || '').trim().substring(0, 50) + (process.env[key]?.length > 50 ? '...' : '');
-      return acc;
-    }, {});
-
-  const dbs = discoverDatabases();
-  const safe = dbs.map(d => ({
-    name: d.name,
-    url: d.url ? d.url.substring(0, 30) + '...' : 'MISSING'
-  }));
-
-  return sendJson(res, 200, {
-    rawEnvKeys: allKeys,
-    discoveredDbs: safe
-  });
-}
 
   // ── Authentication check ───────────────────────────
   const providedKey = req.headers['x-api-key'] || searchParams.get('api_key');
