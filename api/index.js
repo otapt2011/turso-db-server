@@ -1,0 +1,346 @@
+// api/index.js – Vercel serverless function (stateless, JWT auth)
+const jwt = require('jsonwebtoken');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'change-this-to-a-random-string';
+const AUTH_PASSWORD = process.env.AUTH_PASSWORD || '';
+const API_KEY = process.env.API_KEY || '';
+
+// ── Helpers ──────────────────────────────────────────
+function sendJson(res, status, data) {
+  res.setHeader('Content-Type', 'application/json');
+  res.status(status).json(data);
+}
+
+function getRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    if (req.body) return resolve(JSON.stringify(req.body));
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => resolve(body));
+    req.on('error', reject);
+  });
+}
+
+function discoverDatabases() {
+  const dbs = [];
+  for (const key of Object.keys(process.env)) {
+    const match = key.match(/^TURSO_DB_(.+)_URL$/);
+    if (match) {
+      const upper = match[1];
+      const name = upper.toLowerCase();
+      const url = (process.env[key] || '').trim();
+      if (!url) {
+        console.warn(`Skipping ${name}: URL is empty`);
+        continue;
+      }
+      const token = (process.env[`TURSO_DB_${upper}_TOKEN`] || '').trim();
+      dbs.push({ name, url, token });
+    }
+  }
+  return dbs;
+}
+
+function getHttpUrl(libsqlUrl) {
+  return libsqlUrl.replace(/^libsql:\/\//, 'https://').replace(/\/$/, '');
+}
+
+async function tursoExecute(dbUrl, dbToken, sql) {
+  if (!dbUrl) throw new Error('Database URL is empty – check environment variable');
+  const endpoint = getHttpUrl(dbUrl) + '/v2/pipeline';
+  const body = JSON.stringify({
+    requests: [
+      { type: 'execute', stmt: { sql } },
+      { type: 'close' }
+    ]
+  });
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${dbToken}`,
+        'Content-Type': 'application/json'
+      },
+      body
+    });
+  } catch (fetchErr) {
+    throw new Error(`Turso fetch failed: ${fetchErr.message}`);
+  }
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || data.message || `HTTP ${response.status}`);
+  }
+  const executeResponse = data.results?.[0];
+  if (executeResponse?.type === 'error') {
+    throw new Error(executeResponse.error?.message || 'Turso pipeline error');
+  }
+  const executeResult = executeResponse?.response?.result;
+  if (!executeResult) {
+    throw new Error('Unexpected Turso response: ' + JSON.stringify(data).substring(0, 300));
+  }
+  return executeResult;
+}
+
+// ── Smart SQL splitter (exact copy from your working server.js) ──
+function splitSqlStatements(sql) {
+  const statements = [];
+  let current = '';
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let inBlockComment = false;
+  let inLineComment = false;
+  let parenDepth = 0;
+  let beginDepth = 0;
+
+  let i = 0;
+  while (i < sql.length) {
+    const char = sql[i];
+
+    if (!inSingleQuote && !inDoubleQuote && !inLineComment && char === '/' && sql[i + 1] === '*') {
+      inBlockComment = true;
+      current += '/*';
+      i += 2; continue;
+    }
+    if (inBlockComment && char === '*' && sql[i + 1] === '/') {
+      inBlockComment = false;
+      current += '*/';
+      i += 2; continue;
+    }
+    if (inBlockComment) { current += char; i++; continue; }
+
+    if (!inSingleQuote && !inDoubleQuote && !inBlockComment && char === '-' && sql[i + 1] === '-') {
+      inLineComment = true;
+      current += '--';
+      i += 2; continue;
+    }
+    if (inLineComment && char === '\n') {
+      inLineComment = false;
+      current += char; i++; continue;
+    }
+    if (inLineComment) { current += char; i++; continue; }
+
+    if (char === "'" && !inDoubleQuote && !inBlockComment && !inLineComment) {
+      inSingleQuote = !inSingleQuote;
+    } else if (char === '"' && !inSingleQuote && !inBlockComment && !inLineComment) {
+      inDoubleQuote = !inDoubleQuote;
+    }
+
+    if (!inSingleQuote && !inDoubleQuote && !inBlockComment && !inLineComment) {
+      if (char === '(') parenDepth++;
+      else if (char === ')') { if (parenDepth > 0) parenDepth--; }
+    }
+
+    if (!inSingleQuote && !inDoubleQuote && !inBlockComment && !inLineComment) {
+      if (char === 'B' || char === 'b') {
+        const sub = sql.substring(i, i + 5);
+        if (/^BEGIN\b/i.test(sub) && !/[A-Za-z0-9_]/.test(sql[i + 5] || '')) beginDepth++;
+      }
+      if (char === 'E' || char === 'e') {
+        const sub = sql.substring(i, i + 3);
+        if (/^END\b/i.test(sub) && !/[A-Za-z0-9_]/.test(sql[i + 3] || '')) {
+          if (beginDepth > 0) beginDepth--;
+        }
+      }
+    }
+
+    if (char === ';' && !inSingleQuote && !inDoubleQuote && !inBlockComment && !inLineComment && parenDepth === 0 && beginDepth === 0) {
+      const trimmed = current.trim();
+      if (trimmed) statements.push(trimmed);
+      current = '';
+      i++;
+      continue;
+    }
+
+    current += char;
+    i++;
+  }
+
+  const remaining = current.trim();
+  if (remaining) statements.push(remaining);
+  return statements.filter(s => s.length > 0);
+}
+
+// ── Main handler ─────────────────────────────────────
+module.exports = async (req, res) => {
+  // CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return;
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(req.url, `http://${req.headers.host}`);
+  } catch (e) {
+    sendJson(res, 400, { error: 'Invalid URL' });
+    return;
+  }
+
+  const { pathname } = parsedUrl;
+  const searchParams = parsedUrl.searchParams;
+  const method = req.method;
+
+  // ── Login endpoint (no auth required) ──────────────
+  if (method === 'POST' && pathname === '/auth/login') {
+    if (!AUTH_PASSWORD) {
+      return sendJson(res, 500, { error: 'AUTH_PASSWORD not set' });
+    }
+    let bodyStr;
+    try { bodyStr = await getRequestBody(req); } catch { return sendJson(res, 400, { error: 'Failed to read body' }); }
+    let password;
+    try { password = JSON.parse(bodyStr).password; } catch { return sendJson(res, 400, { error: 'Invalid JSON' }); }
+    if (password !== AUTH_PASSWORD) {
+      return sendJson(res, 401, { error: 'Incorrect password' });
+    }
+    const token = jwt.sign({ user: 'fifa-editor' }, JWT_SECRET, { expiresIn: '24h' });
+    return sendJson(res, 200, { token });
+  }
+
+  // ── PUBLIC DEBUG ROUTE (no auth) ───────────────────
+  if (method === 'GET' && pathname === '/api/debug') {
+    const allKeys = Object.keys(process.env)
+      .filter(k => k.startsWith('TURSO_DB_'))
+      .reduce((acc, key) => {
+        acc[key] = (process.env[key] || '').trim().substring(0, 50) + (process.env[key]?.length > 50 ? '...' : '');
+        return acc;
+      }, {});
+
+    const dbs = discoverDatabases();
+    const safe = dbs.map(d => ({
+      name: d.name,
+      url: d.url ? d.url.substring(0, 30) + '...' : 'MISSING'
+    }));
+
+    return sendJson(res, 200, {
+      rawEnvKeys: allKeys,
+      discoveredDbs: safe
+    });
+  }
+
+  // ── Authentication check ───────────────────────────
+  const providedKey = req.headers['x-api-key'] || searchParams.get('api_key');
+
+  if (AUTH_PASSWORD) {
+    if (!providedKey) return sendJson(res, 401, { error: 'Missing token' });
+    try {
+      jwt.verify(providedKey, JWT_SECRET);
+    } catch (e) {
+      if (API_KEY && providedKey === API_KEY) {
+        // legacy key fallback
+      } else {
+        return sendJson(res, 401, { error: 'Unauthorized – invalid or expired token' });
+      }
+    }
+  } else if (API_KEY) {
+    if (providedKey !== API_KEY) return sendJson(res, 401, { error: 'Unauthorized' });
+  }
+
+  // ── Route handling ─────────────────────────────────
+  try {
+    // Root
+    if (method === 'GET' && pathname === '/') {
+      return sendJson(res, 200, {
+        status: 'ok',
+        message: 'Multi‑database server (Turso) on Vercel',
+        endpoints: {
+          listDatabases: 'GET /api/databases',
+          createDb: 'POST /api/database/:name',
+          deleteDb: 'DELETE /api/database/:name',
+          query: 'GET /api/:database/query?sql=...',
+          exec: 'POST /api/:database/exec  (body: { "sql": "..." })',
+          login: 'POST /auth/login  (body: { "password": "..." })',
+          debug: 'GET /api/debug  (public, list discovered databases)'
+        }
+      });
+    }
+
+    // List databases
+    if (method === 'GET' && pathname === '/api/databases') {
+      const dbs = discoverDatabases().map(d => d.name);
+      return sendJson(res, 200, dbs);
+    }
+
+    // Create/Delete (informational)
+    const dbMatch = pathname.match(/^\/api\/database\/([^\/]+)$/);
+    if (dbMatch) {
+      const dbName = dbMatch[1].toLowerCase();
+      if (method === 'POST') {
+        return sendJson(res, 200, {
+          message: 'Create the database in the Turso dashboard, then add URL & token as environment variables.'
+        });
+      }
+      if (method === 'DELETE') {
+        return sendJson(res, 200, {
+          message: 'Delete the database in the Turso dashboard. Remove its environment variables from Railway.'
+        });
+      }
+      return sendJson(res, 405, { error: 'Method not allowed' });
+    }
+
+    // Read‑only query
+    const queryMatch = pathname.match(/^\/api\/([^\/]+)\/query$/);
+    if (queryMatch && method === 'GET') {
+      const dbName = queryMatch[1].toLowerCase();
+      const sql = searchParams.get('sql');
+      if (!sql) return sendJson(res, 400, { error: 'Missing ?sql= parameter' });
+      if (!/^\s*SELECT\b/i.test(sql)) {
+        return sendJson(res, 400, { error: 'Only SELECT queries are allowed on this endpoint' });
+      }
+
+      const dbs = discoverDatabases();
+      const db = dbs.find(d => d.name === dbName);
+      if (!db) return sendJson(res, 404, { error: `Database '${dbName}' not found` });
+
+      try {
+        const result = await tursoExecute(db.url, db.token, sql);
+        const cols = result.cols || [];
+        const rawRows = result.rows || [];
+        const rows = rawRows.map(row =>
+          Object.fromEntries(
+            row.map((cell, idx) => [cols[idx]?.name || `col${idx}`, cell.value])
+          )
+        );
+        return sendJson(res, 200, rows);
+      } catch (err) {
+        return sendJson(res, 400, { error: err.message });
+      }
+    }
+
+    // Write / multi‑statement execution
+    const execMatch = pathname.match(/^\/api\/([^\/]+)\/exec$/);
+    if (execMatch && method === 'POST') {
+      const dbName = execMatch[1].toLowerCase();
+      let body;
+      try { body = await getRequestBody(req); } catch { return sendJson(res, 400, { error: 'Failed to read body' }); }
+      let sql;
+      try { sql = JSON.parse(body).sql; } catch { return sendJson(res, 400, { error: 'Invalid JSON' }); }
+      if (!sql) return sendJson(res, 400, { error: 'Missing "sql" in body' });
+
+      const dbs = discoverDatabases();
+      const db = dbs.find(d => d.name === dbName);
+      if (!db) return sendJson(res, 404, { error: `Database '${dbName}' not found` });
+
+      try {
+        const statements = splitSqlStatements(sql);
+        let totalChanges = 0;
+        for (const stmt of statements) {
+          const result = await tursoExecute(db.url, db.token, stmt);
+          totalChanges += result.rows_affected || 0;
+        }
+        return sendJson(res, 200, { changes: totalChanges });
+      } catch (err) {
+        return sendJson(res, 400, { error: err.message });
+      }
+    }
+
+    // Fallback
+    sendJson(res, 404, { error: 'Not found' });
+  } catch (err) {
+    console.error('Request error:', err.message);
+    sendJson(res, 500, { error: err.message });
+  }
+};
