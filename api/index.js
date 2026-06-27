@@ -220,6 +220,57 @@ module.exports = async (req, res) => {
       discoveredDbs: safe
     });
   }
+  // ── PUBLIC USER DETAIL ROUTE (no auth) ─────────────
+const userMatch = pathname.match(/^\/api\/user\/([^\/]+)$/);
+if (userMatch && method === 'GET') {
+    const username = decodeURIComponent(userMatch[1]);
+    if (!username) return sendJson(res, 400, { error: 'Missing username' });
+
+    try {
+        const tiktokUrl = `https://www.tiktok.com/@${username}`;
+        const tiktokResp = await fetch(tiktokUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept-Language': 'en-US,en;q=0.9'
+            }
+        });
+        if (!tiktokResp.ok) {
+            return sendJson(res, tiktokResp.status, { error: `TikTok returned ${tiktokResp.status}` });
+        }
+        const html = await tiktokResp.text();
+
+        const match = html.match(
+            /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s
+        );
+        if (!match) return sendJson(res, 404, { error: 'User not found' });
+
+        const data = JSON.parse(match[1]);
+        const userDetail = data['__DEFAULT_SCOPE__']?.['webapp.user-detail'];
+        if (!userDetail) return sendJson(res, 404, { error: 'User not found' });
+
+        const user = userDetail?.userInfo?.user;
+        const avatar =
+            user?.avatarLarger ||
+            user?.avatarMedium ||
+            user?.avatarThumb ||
+            user?.avatar ||
+            null;
+
+        const userData = {
+            username: user?.uniqueId || username,
+            nickname: user?.nickname || '',
+            avatar: avatar,
+            secUid: user?.secUid || null,
+            bio: user?.signature || '',
+            followerCount: user?.followerCount || 0,
+            followingCount: user?.followingCount || 0,
+        };
+        return sendJson(res, 200, { success: true, data: userData });
+    } catch (err) {
+        console.error('Error fetching user:', err.message);
+        return sendJson(res, 500, { error: 'Failed to fetch user data' });
+    }
+}
 
   // ── Authentication check ───────────────────────────
   const providedKey = req.headers['x-api-key'] || searchParams.get('api_key');
